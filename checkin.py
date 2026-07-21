@@ -9,7 +9,7 @@ import os
 import sys
 import json
 import base64
-import requests
+from curl_cffi import requests
 from datetime import datetime
 from typing import Optional
 
@@ -62,7 +62,8 @@ class NewAPICheckin:
         self.session_cookie = session_cookie
         self.original_cf_clearance = cf_clearance
         self.cf_bypassed = False
-        self.session = requests.Session()
+        # 使用 curl_cffi 的浏览器指纹模拟（TLS/JA3），提升 Cloudflare 通过率
+        self.session = requests.Session(impersonate='chrome')
         self.session.cookies.set('session', session_cookie)
 
         if cf_clearance:
