@@ -14,11 +14,12 @@ from datetime import datetime
 from typing import Optional
 
 try:
-    from cf_bypass import detect_cloudflare_block, CloudflareBypasser
+    from cf_bypass import detect_cloudflare_block, detect_waf_block, CloudflareBypasser
     CF_BYPASS_AVAILABLE = True
 except ImportError:
     CF_BYPASS_AVAILABLE = False
     detect_cloudflare_block = None
+    detect_waf_block = None
     CloudflareBypasser = None
 
 try:
@@ -58,13 +59,17 @@ class NewAPICheckin:
         return '****'
 
     def __init__(self, base_url: str, session_cookie: str, user_id: str = None, cf_clearance: str = None):
-        self.base_url = base_url.rstrip('/')
-        self.session_cookie = session_cookie
+        # 清理 URL：去掉末尾的 / 以及部分 .env 加载器（如 uv）对 # 转义引入的反斜杠
+        self.base_url = base_url.strip().rstrip('/').replace('\\', '')
+        # session 是 base64（不含反斜杠），清除转义引入的反斜杠
+        self.session_cookie = session_cookie.replace('\\', '')
         self.original_cf_clearance = cf_clearance
         self.cf_bypassed = False
+        self.browser_user_info = None  # Playwright 会话内获取的用户信息缓存
+        self.browser_history = None    # Playwright 会话内获取的签到历史缓存
         # 使用 curl_cffi 的浏览器指纹模拟（TLS/JA3），提升 Cloudflare 通过率
         self.session = requests.Session(impersonate='chrome')
-        self.session.cookies.set('session', session_cookie)
+        self.session.cookies.set('session', self.session_cookie)
 
         if cf_clearance:
             self.session.cookies.set('cf_clearance', cf_clearance)
@@ -146,13 +151,17 @@ class NewAPICheckin:
             try:
                 data = resp.json()
             except json.JSONDecodeError as e:
-                # 检测是否是 Cloudflare 拦截
-                if detect_cloudflare_block:
+                # 检测是否是 Cloudflare / 阿里云盾 WAF 拦截
+                is_blocked = False
+                reason = ''
+                if detect_waf_block:
+                    is_blocked, reason = detect_waf_block(resp.status_code, resp.text)
+                if not is_blocked and detect_cloudflare_block:
                     is_blocked, reason = detect_cloudflare_block(resp.status_code, resp.text)
-                    if is_blocked:
-                        print(f'[CF] 获取用户信息时检测到 Cloudflare 拦截: {reason}')
-                        print(f'[CF] 该站点需要 CF 绕过才能访问')
-                        return None
+                if is_blocked:
+                    print(f'[WAF] 获取用户信息时检测到 {reason}')
+                    # 由后续 checkin() 的浏览器会话统一获取用户信息
+                    return None
                 print(f'[错误] 响应格式错误 (HTTP {resp.status_code}): 无法解析 JSON')
                 if verbose:
                     print(f'  [调试] 原始响应: {resp.text[:500]}')
@@ -213,7 +222,7 @@ class NewAPICheckin:
         }
 
         try:
-            resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
+            resp = self.session.post(f'{self.base_url}/api/user/sign_in', timeout=30)
 
             if resp.status_code == 401:
                 result['message'] = '认证失败: Session 可能已过期，请重新获取'
@@ -222,11 +231,16 @@ class NewAPICheckin:
             try:
                 data = resp.json()
             except json.JSONDecodeError:
-                if detect_cloudflare_block:
+                # 检测 WAF 拦截（Cloudflare / 阿里云盾），走浏览器绕过
+                is_blocked = False
+                reason = ''
+                if detect_waf_block:
+                    is_blocked, reason = detect_waf_block(resp.status_code, resp.text)
+                if not is_blocked and detect_cloudflare_block:
                     is_blocked, reason = detect_cloudflare_block(resp.status_code, resp.text)
-                    if is_blocked:
-                        print(f'[CF] 检测到 Cloudflare 拦截: {reason}')
-                        return self._cf_bypass_checkin()
+                if is_blocked:
+                    print(f'[WAF] 检测到拦截: {reason}')
+                    return self._cf_bypass_checkin()
                 content_preview = resp.text[:200] if resp.text else '(空响应)'
                 result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
                 return result
@@ -234,7 +248,7 @@ class NewAPICheckin:
             if detect_cloudflare_block and resp.status_code in (403, 503):
                 is_blocked, reason = detect_cloudflare_block(resp.status_code, json.dumps(data))
                 if is_blocked:
-                    print(f'[CF] 检测到 Cloudflare 拦截: {reason}')
+                    print(f'[WAF] 检测到 Cloudflare 拦截: {reason}')
                     return self._cf_bypass_checkin()
 
             if resp.status_code == 200:
@@ -283,36 +297,40 @@ class NewAPICheckin:
             result['message'] = 'Cloudflare 拦截: Playwright 未正确安装'
             return result
 
-        print('[CF] 开始 Playwright 绕过流程...')
+        print('[WAF] 开始 Playwright 绕过流程...')
         browser_result = bypasser.bypass_and_checkin()
 
         if not browser_result:
-            result['message'] = 'Cloudflare 绕过失败: 无法通过 CF 验证'
+            result['message'] = 'WAF 绕过失败: 无法通过验证'
             return result
 
         self.cf_bypassed = True
 
         if browser_result.get('error'):
-            result['message'] = f'CF 绕过后签到失败: {browser_result["error"]}'
+            result['message'] = f'WAF 绕过后签到失败: {browser_result["error"]}'
             return result
+
+        # 同一浏览器会话内顺带获取用户信息和签到历史，避免再次被 WAF 拦截
+        self.browser_user_info = bypasser.user_info_cache
+        self.browser_history = bypasser.history_cache
 
         if browser_result.get('alreadyCheckedIn'):
             result['success'] = True
-            result['message'] = browser_result.get('message', '今日已签到 (CF绕过)')
+            result['message'] = browser_result.get('message', '今日已签到 (WAF绕过)')
         elif browser_result.get('success'):
             result['success'] = True
-            result['message'] = browser_result.get('message', '签到成功 (CF绕过)')
+            result['message'] = browser_result.get('message', '签到成功 (WAF绕过)')
             data = browser_result.get('data', {})
             if isinstance(data, dict):
                 checkin_data = data.get('data', data)
                 result['checkin_date'] = checkin_data.get('checkin_date')
                 result['quota_awarded'] = checkin_data.get('quota_awarded')
         else:
-            result['message'] = browser_result.get('message', 'CF 绕过后签到失败')
+            result['message'] = browser_result.get('message', 'WAF 绕过后签到失败')
 
         return result
 
-    def get_checkin_history(self, month: str = None) -> Optional[dict]:
+    def get_checkin_history(self, month: str = None, verbose: bool = False) -> Optional[dict]:
         """
         获取签到历史
 
@@ -332,9 +350,12 @@ class NewAPICheckin:
                 data = resp.json()
                 if data.get('success'):
                     return data.get('data')
+                # 部分站点未开放签到历史接口（success=false），静默跳过
             return None
         except Exception as e:
-            print(f'[错误] 获取签到历史失败: {e}')
+            # 历史接口属于增值统计，失败不阻塞主流程
+            if verbose:
+                print(f'[错误] 获取签到历史失败: {e}')
             return None
 
 
@@ -520,19 +541,31 @@ def main():
 
         client = NewAPICheckin(url, session_cookie, user_id, cf_clearance)
 
-        # 获取用户信息
+        # 尝试直连获取用户信息（非 WAF 站点直接成功）
         user_info = client.get_user_info()
-        if user_info:
-            username = user_info.get('username', '未知')
+
+        # 执行签到（直连被 WAF 拦截时，浏览器会话会顺带获取用户信息）
+        result = client.checkin()
+        checkin_count = 0  # 默认值，避免历史接口失败时未定义
+
+        # 用户信息：直连结果优先，否则用浏览器会话内获取的结果
+        if user_info and isinstance(user_info, dict):
+            username = user_info.get('username', '')
+        elif client.browser_user_info and client.browser_user_info.get('success'):
+            b_data = client.browser_user_info.get('data')
+            if isinstance(b_data, dict):
+                username = b_data.get('username', '')
+            else:
+                username = ''
+        else:
+            username = ''
+
+        if username:
             # 用户名也脱敏，只显示前3个字符
             masked_username = username[:3] + '***' if len(username) > 3 else '***'
             print(f'  用户: {masked_username}')
         else:
             print('  用户: 获取失败（可能 session 已过期）')
-
-        # 执行签到
-        result = client.checkin()
-        checkin_count = 0  # 默认值，避免历史接口失败时未定义
 
         if result['success']:
             success_count += 1
@@ -556,6 +589,10 @@ def main():
 
             # 获取本月签到统计
             history = client.get_checkin_history()
+            if not history and client.browser_history:
+                b_hist = client.browser_history
+                if b_hist.get('success'):
+                    history = b_hist.get('data')
             if history and history.get('stats'):
                 stats = history['stats']
                 checkin_count = stats.get('checkin_count', 0)

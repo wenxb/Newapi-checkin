@@ -48,3 +48,7 @@ newapi_accounts.txt
 
 # 日志
 *.log
+
+# Playwright MCP 临时产物
+.playwright-cli/
+.playwright-mcp/
