@@ -58,18 +58,26 @@ class NewAPICheckin:
         """
         return '****'
 
-    def __init__(self, base_url: str, session_cookie: str, user_id: str = None, cf_clearance: str = None):
+    def __init__(self, base_url: str, session_cookie: str = None, user_id: str = None,
+                 cf_clearance: str = None, username: str = None, password: str = None):
         # 清理 URL：去掉末尾的 / 以及部分 .env 加载器（如 uv）对 # 转义引入的反斜杠
         self.base_url = base_url.strip().rstrip('/').replace('\\', '')
         # session 是 base64（不含反斜杠），清除转义引入的反斜杠
-        self.session_cookie = session_cookie.replace('\\', '')
+        self.session_cookie = (session_cookie or '').replace('\\', '')
+        self.username = (username or '').strip()
+        self.password = (password or '').strip()
         self.original_cf_clearance = cf_clearance
         self.cf_bypassed = False
         self.browser_user_info = None  # Playwright 会话内获取的用户信息缓存
         self.browser_history = None    # Playwright 会话内获取的签到历史缓存
+        self.login_data = None
+        self.logged_in = False
+        self.checkin_count = 0
+
         # 使用 curl_cffi 的浏览器指纹模拟（TLS/JA3），提升 Cloudflare 通过率
         self.session = requests.Session(impersonate='chrome')
-        self.session.cookies.set('session', self.session_cookie)
+        if self.session_cookie:
+            self.session.cookies.set('session', self.session_cookie)
 
         if cf_clearance:
             self.session.cookies.set('cf_clearance', cf_clearance)
@@ -83,12 +91,18 @@ class NewAPICheckin:
         })
 
         if user_id:
-            self.user_id = user_id
-            self.session.headers.update({'new-api-user': str(user_id)})
-        else:
-            self.user_id = self._extract_user_id_from_session(session_cookie)
+            self.user_id = str(user_id)
+            self.session.headers.update({'new-api-user': str(self.user_id)})
+        elif self.session_cookie:
+            self.user_id = self._extract_user_id_from_session(self.session_cookie)
             if self.user_id:
                 self.session.headers.update({'new-api-user': str(self.user_id)})
+        else:
+            self.user_id = None
+
+    def _is_agentrouter(self) -> bool:
+        """判断是否为 AgentRouter 平台"""
+        return 'agentrouter' in self.base_url.lower()
 
     def _extract_user_id_from_session(self, session_cookie: str) -> Optional[str]:
         """
@@ -97,16 +111,10 @@ class NewAPICheckin:
         Session Cookie 格式通常是 Base64 编码的数据
         """
         try:
-            # 尝试解码 Session Cookie
-            # Session 格式类似：MTc2NzQxMzYzM3xE...
-            # 解码后可能包含用户信息
             decoded = base64.b64decode(session_cookie + '==')  # 添加 padding
             decoded_str = decoded.decode('utf-8', errors='ignore')
 
-            # 查找可能的用户ID模式
-            # 例如：linuxdo_988 中的 988
             import re
-            # 查找 "linuxdo_数字" 或 "id"=数字 等模式
             patterns = [
                 r'linuxdo[_-](\d+)',  # linuxdo_988
                 r'"id"[:\s]+(\d+)',    # "id": 988
@@ -124,15 +132,127 @@ class NewAPICheckin:
 
         return None
 
+    def login(self, verbose: bool = False) -> dict:
+        """
+        使用用户名/邮箱和密码登录
+
+        Returns:
+            dict: {'success': bool, 'message': str, 'checked_in': bool, 'data': dict}
+        """
+        if not self.username or not self.password:
+            return {'success': False, 'message': '未配置用户名或密码', 'checked_in': False}
+
+        login_url = f'{self.base_url}/api/user/login'
+        payload = {'username': self.username, 'password': self.password}
+        headers = {
+            'Content-Type': 'application/json;charset=UTF-8',
+            'Origin': self.base_url,
+            'Referer': f'{self.base_url}/login',
+        }
+
+        try:
+            resp = self.session.post(login_url, json=payload, headers=headers, timeout=30)
+            if verbose:
+                print(f'  [调试] 登录 HTTP 状态码: {resp.status_code}')
+
+            # 429 请求过多处理
+            if resp.status_code == 429:
+                return {
+                    'success': False,
+                    'message': '请求过于频繁 (HTTP 429: 登录频率限制)，请稍后再试',
+                    'checked_in': False,
+                    'http_status': 429
+                }
+
+            # 检测 WAF 拦截
+            is_blocked = False
+            reason = ''
+            if detect_waf_block:
+                is_blocked, reason = detect_waf_block(resp.status_code, resp.text)
+            if not is_blocked and detect_cloudflare_block:
+                is_blocked, reason = detect_cloudflare_block(resp.status_code, resp.text)
+            if is_blocked:
+                print(f'[WAF] 登录时检测到 {reason}，尝试浏览器绕过...')
+                return self._cf_bypass_login()
+
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                return {'success': False, 'message': f'响应格式非 JSON (HTTP {resp.status_code}): {resp.text[:100]}', 'checked_in': False}
+
+            if resp.status_code == 200 and data.get('success'):
+                user_data = data.get('data') or {}
+                self.login_data = user_data
+                self.logged_in = True
+
+                if 'id' in user_data:
+                    self.user_id = str(user_data['id'])
+                    self.session.headers.update({'new-api-user': str(self.user_id)})
+
+                new_session = resp.cookies.get('session') or self.session.cookies.get('session')
+                if new_session:
+                    self.session_cookie = new_session
+
+                checked_in = user_data.get('checked_in', False)
+                return {
+                    'success': True,
+                    'message': data.get('message') or ('签到成功，新增额度已到账' if checked_in else '登录成功！'),
+                    'checked_in': checked_in,
+                    'data': user_data
+                }
+            else:
+                msg = data.get('message', '未知错误')
+                return {'success': False, 'message': f'登录失败: {msg}', 'checked_in': False}
+
+        except requests.exceptions.Timeout:
+            return {'success': False, 'message': '登录请求超时', 'checked_in': False}
+        except requests.exceptions.RequestException as e:
+            return {'success': False, 'message': f'登录网络请求失败: {e}', 'checked_in': False}
+        except Exception as e:
+            return {'success': False, 'message': f'登录异常: {e}', 'checked_in': False}
+
+    def _cf_bypass_login(self) -> dict:
+        """使用 Playwright 绕过 WAF 并执行登录"""
+        if not CF_BYPASS_AVAILABLE or not CloudflareBypasser:
+            return {'success': False, 'message': '检测到 WAF 拦截，但未安装 Playwright', 'checked_in': False}
+
+        bypasser = CloudflareBypasser(
+            self.base_url,
+            self.session_cookie,
+            self.user_id,
+            self.username,
+            self.password
+        )
+        if not bypasser.is_available():
+            return {'success': False, 'message': 'Playwright 未正确安装', 'checked_in': False}
+
+        print('[WAF] 开始 Playwright 登录绕过流程...')
+        res = bypasser.bypass_and_login()
+        if res.get('success'):
+            self.cf_bypassed = True
+            self.logged_in = True
+            if bypasser.session_cookie:
+                self.session_cookie = bypasser.session_cookie
+                self.session.cookies.set('session', self.session_cookie)
+            if bypasser.user_id:
+                self.user_id = str(bypasser.user_id)
+                self.session.headers.update({'new-api-user': str(self.user_id)})
+            self.browser_user_info = bypasser.user_info_cache
+            self.browser_history = bypasser.history_cache
+        return res
+
     def get_user_info(self, verbose: bool = False) -> Optional[dict]:
         """
         获取用户信息
 
         自动设置 new-api-user 请求头
-
-        Args:
-            verbose: 是否显示详细调试信息
         """
+        # 如果配置了用户名和密码且尚未登录且无有效 session，先尝试登录
+        if self.username and self.password and not self.logged_in and not self.session_cookie:
+            login_res = self.login(verbose=verbose)
+            if not login_res['success'] and login_res.get('http_status') != 429:
+                return None
+
         try:
             resp = self.session.get(f'{self.base_url}/api/user/self', timeout=30)
 
@@ -142,6 +262,11 @@ class NewAPICheckin:
 
             # 检查认证失败
             if resp.status_code == 401:
+                # 尝试重新登录一次
+                if self.username and self.password and not self.logged_in:
+                    login_res = self.login(verbose=verbose)
+                    if login_res.get('success'):
+                        return self.get_user_info(verbose=verbose)
                 print(f'[错误] 认证失败 (401): Session 可能已过期')
                 if verbose:
                     print(f'  [调试] 完整响应: {resp.text[:500]}')
@@ -150,8 +275,7 @@ class NewAPICheckin:
             # 尝试解析 JSON
             try:
                 data = resp.json()
-            except json.JSONDecodeError as e:
-                # 检测是否是 Cloudflare / 阿里云盾 WAF 拦截
+            except json.JSONDecodeError:
                 is_blocked = False
                 reason = ''
                 if detect_waf_block:
@@ -160,23 +284,17 @@ class NewAPICheckin:
                     is_blocked, reason = detect_cloudflare_block(resp.status_code, resp.text)
                 if is_blocked:
                     print(f'[WAF] 获取用户信息时检测到 {reason}')
-                    # 由后续 checkin() 的浏览器会话统一获取用户信息
                     return None
                 print(f'[错误] 响应格式错误 (HTTP {resp.status_code}): 无法解析 JSON')
                 if verbose:
                     print(f'  [调试] 原始响应: {resp.text[:500]}')
                 return None
 
-            if verbose:
-                print(f'  [调试] success 字段: {data.get("success")}')
-                print(f'  [调试] message 字段: {data.get("message")}')
-
             if resp.status_code == 200:
                 if data.get('success'):
                     user_data = data.get('data')
-                    # 保存用户ID并设置到请求头
                     if user_data and 'id' in user_data:
-                        self.user_id = user_data['id']
+                        self.user_id = str(user_data['id'])
                         self.session.headers.update({
                             'new-api-user': str(self.user_id)
                         })
@@ -206,14 +324,121 @@ class NewAPICheckin:
         """
         执行签到
 
-        流程（借鉴 Chrome 扩展 background.js:115-248）：
-        1. requests 直连签到（快速模式）
-        2. CF 拦截检测 → Playwright 获取 cookie 后重新签到
-        3. 仍然失败 → Playwright 浏览器内直接签到（终极回退）
-
-        Returns:
-            签到结果字典
+        如果为 AgentRouter：走邮箱密码登录触发签到流程
+        如果是标准 NewAPI：走 requests POST /api/user/sign_in 流程
         """
+        if self._is_agentrouter():
+            return self._checkin_agentrouter()
+        return self._checkin_standard()
+
+    def _checkin_agentrouter(self) -> dict:
+        """
+        AgentRouter 专属签到流程：
+        根据官方规则与 FAQ，该平台只支持邮箱和密码登录，登录动作本身即触发每日签到领 $25 额度。
+        平台无 /api/user/sign_in 接口，签到记录可通过 /api/log/self?type=4 获取。
+        """
+        result = {
+            'success': False,
+            'message': '',
+            'checkin_date': None,
+            'quota_awarded': None
+        }
+
+        import pytz
+        beijing_tz = pytz.timezone('Asia/Shanghai')
+        today_str = datetime.now(beijing_tz).strftime('%Y-%m-%d')
+
+        if self.username and self.password:
+            if not self.logged_in:
+                login_res = self.login()
+                if not login_res['success']:
+                    # 特殊处理：如果是 429 登录受限，若有 session，尝试从日志确认今日是否已签到
+                    if login_res.get('http_status') == 429 and (self.session_cookie or self.session.cookies.get('session')):
+                        log_info = self._get_agentrouter_log_status()
+                        if log_info and log_info.get('checked_in_today'):
+                            result['success'] = True
+                            result['message'] = f"今日已完成签到 (登录受限 429，已确认今日记录)"
+                            result['checkin_date'] = log_info.get('checkin_date')
+                            result['quota_awarded'] = log_info.get('quota_awarded', 12500000)
+                            return result
+                    result['message'] = login_res['message']
+                    return result
+
+            # 登录成功后，从日志获取今日签到详情
+            log_info = self._get_agentrouter_log_status()
+            if log_info:
+                if log_info.get('checked_in_today'):
+                    result['success'] = True
+                    result['message'] = log_info.get('content') or '每日签到成功，增加额度 ＄25.000000 额度'
+                    result['checkin_date'] = log_info.get('checkin_date', today_str)
+                    result['quota_awarded'] = log_info.get('quota_awarded', 12500000)
+                    return result
+
+            if self.login_data and self.login_data.get('checked_in'):
+                result['success'] = True
+                result['message'] = '签到成功，新增额度已到账'
+                result['checkin_date'] = today_str
+                result['quota_awarded'] = 12500000
+                return result
+            elif self.logged_in:
+                result['success'] = True
+                result['message'] = '登录成功 (今日已完成签到)'
+                result['checkin_date'] = today_str
+                return result
+            else:
+                result['message'] = 'AgentRouter 登录签到失败'
+                return result
+        else:
+            # 仅配置了 session cookie
+            if not self.session_cookie:
+                result['message'] = 'AgentRouter 必须配置邮箱和密码 (username/password) 登录以完成签到'
+                return result
+
+            log_info = self._get_agentrouter_log_status()
+            if log_info and log_info.get('checked_in_today'):
+                result['success'] = True
+                result['message'] = f"今日已签到: {log_info.get('content')}"
+                result['checkin_date'] = log_info.get('checkin_date')
+                result['quota_awarded'] = log_info.get('quota_awarded', 12500000)
+                return result
+            else:
+                result['message'] = 'AgentRouter 必须通过邮箱和密码登录才算签到，仅有 Session 无法触发签到，请配置 username 与 password'
+                return result
+
+    def _get_agentrouter_log_status(self) -> Optional[dict]:
+        """从 AgentRouter 的 /api/log/self?type=4 获取签到日志记录"""
+        try:
+            import pytz
+            beijing_tz = pytz.timezone('Asia/Shanghai')
+            today_str = datetime.now(beijing_tz).strftime('%Y-%m-%d')
+
+            resp = self.session.get(f'{self.base_url}/api/log/self?type=4', timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('data') and isinstance(data['data'], dict):
+                    log_data = data['data']
+                    items = log_data.get('items', [])
+                    total = log_data.get('total', 0)
+                    self.checkin_count = total
+                    if items:
+                        latest = items[0]
+                        created_at = latest.get('created_at', 0)
+                        log_date = datetime.fromtimestamp(created_at, beijing_tz).strftime('%Y-%m-%d')
+                        content = latest.get('content', '')
+                        quota_awarded = 12500000  # $25 * 500,000 = 12,500,000 tokens
+                        return {
+                            'checked_in_today': (log_date == today_str),
+                            'checkin_date': log_date,
+                            'content': content,
+                            'quota_awarded': quota_awarded,
+                            'total': total
+                        }
+        except Exception:
+            pass
+        return None
+
+    def _checkin_standard(self) -> dict:
+        """标准 NewAPI 签到流程"""
         result = {
             'success': False,
             'message': '',
@@ -291,7 +516,13 @@ class NewAPICheckin:
             result['message'] = 'Cloudflare 拦截: 需安装 Playwright 才能自动绕过 (pip install playwright && playwright install chromium)'
             return result
 
-        bypasser = CloudflareBypasser(self.base_url, self.session_cookie, self.user_id)
+        bypasser = CloudflareBypasser(
+            self.base_url,
+            self.session_cookie,
+            self.user_id,
+            self.username,
+            self.password
+        )
 
         if not bypasser.is_available():
             result['message'] = 'Cloudflare 拦截: Playwright 未正确安装'
@@ -337,6 +568,20 @@ class NewAPICheckin:
         Args:
             month: 月份，格式 YYYY-MM，默认当前月
         """
+        if self._is_agentrouter():
+            log_info = self._get_agentrouter_log_status()
+            total = self.checkin_count or (log_info.get('total', 0) if log_info else 0)
+            if total > 0 or log_info:
+                checked_in_today = log_info.get('checked_in_today', False) if log_info else False
+                return {
+                    'stats': {
+                        'checkin_count': total,
+                        'total_quota': total * 12500000,
+                        'checked_in_today': checked_in_today
+                    }
+                }
+            return None
+
         if month is None:
             month = datetime.now().strftime('%Y-%m')
 
@@ -364,9 +609,11 @@ def parse_accounts(accounts_str: str) -> list:
     解析账号配置
 
     支持格式:
-    1. 单账号: BASE_URL#SESSION_COOKIE
+    1. 单账号: BASE_URL#SESSION_COOKIE 或 BASE_URL#USERNAME#PASSWORD
     2. 多账号: BASE_URL1#SESSION1,BASE_URL2#SESSION2
-    3. JSON格式: [{"url": "...", "session": "..."}]
+    3. JSON格式:
+       [{"url": "...", "session": "..."}] 或
+       [{"url": "...", "username": "...", "password": "..."}]
     """
     accounts = []
 
@@ -378,16 +625,24 @@ def parse_accounts(accounts_str: str) -> list:
         data = json.loads(accounts_str)
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict) and 'url' in item and 'session' in item:
+                if isinstance(item, dict) and 'url' in item:
+                    session = item.get('session', '')
+                    username = item.get('username') or item.get('email') or ''
+                    password = item.get('password', '')
+
+                    # 既无 session 也无 username+password 则跳过
+                    if not session and not (username and password):
+                        continue
+
                     account = {
                         'url': item['url'],
-                        'session': item['session'],
+                        'session': session,
+                        'username': username,
+                        'password': password,
                         'name': item.get('name', '')
                     }
-                    # 如果提供了 user_id，添加到账号信息中
                     if 'user_id' in item:
                         account['user_id'] = item['user_id']
-                    # 如果提供了 cf_clearance，添加到账号信息中
                     if 'cf_clearance' in item:
                         account['cf_clearance'] = item['cf_clearance']
                     accounts.append(account)
@@ -395,16 +650,38 @@ def parse_accounts(accounts_str: str) -> list:
     except json.JSONDecodeError:
         pass
 
-    # 简单格式: URL#SESSION,URL#SESSION
+    # 简单格式: URL#SESSION 或 URL#USERNAME#PASSWORD
     for part in accounts_str.split(','):
         part = part.strip()
         if '#' in part:
-            url, session = part.split('#', 1)
-            accounts.append({
-                'url': url.strip(),
-                'session': session.strip(),
-                'name': ''
-            })
+            pieces = [p.strip() for p in part.split('#')]
+            if len(pieces) == 2:
+                accounts.append({
+                    'url': pieces[0],
+                    'session': pieces[1],
+                    'username': '',
+                    'password': '',
+                    'name': ''
+                })
+            elif len(pieces) >= 3:
+                url, p2, p3 = pieces[0], pieces[1], pieces[2]
+                if '@' in p2 or not p3.isdigit():
+                    accounts.append({
+                        'url': url,
+                        'session': '',
+                        'username': p2,
+                        'password': p3,
+                        'name': ''
+                    })
+                else:
+                    accounts.append({
+                        'url': url,
+                        'session': p2,
+                        'user_id': p3,
+                        'username': '',
+                        'password': '',
+                        'name': ''
+                    })
 
     return accounts
 
@@ -499,6 +776,22 @@ def main():
     print(f'执行时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     print('=' * 50)
 
+    # 尝试加载本地 .env 文件
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
     config_url = os.environ.get('CONFIG_URL', '')
     config_auth = os.environ.get('CONFIG_AUTH', '')
 
@@ -529,17 +822,29 @@ def main():
 
     for i, account in enumerate(accounts, 1):
         url = account['url']
-        session_cookie = account['session']
+        session_cookie = account.get('session', '')
         user_id = account.get('user_id')  # 获取用户ID（如果提供）
         cf_clearance = account.get('cf_clearance')  # 获取 CF clearance（如果提供）
+        username = account.get('username') or account.get('email') or ''
+        password = account.get('password', '')
         name = account.get('name') or f'账号{i}'
 
         print(f'[{i}/{len(accounts)}] {name}')
         print(f'  站点: {NewAPICheckin._mask_url(url)}')
         if user_id:
             print(f'  用户ID: {NewAPICheckin._mask_user_id(user_id)}')
+        elif username:
+            masked_acc = (username[:3] + '***' + username[username.find('@'):]) if '@' in username else (username[:3] + '***')
+            print(f'  账号: {masked_acc}')
 
-        client = NewAPICheckin(url, session_cookie, user_id, cf_clearance)
+        client = NewAPICheckin(
+            base_url=url,
+            session_cookie=session_cookie,
+            user_id=user_id,
+            cf_clearance=cf_clearance,
+            username=username,
+            password=password
+        )
 
         # 尝试直连获取用户信息（非 WAF 站点直接成功）
         user_info = client.get_user_info()
@@ -549,23 +854,25 @@ def main():
         checkin_count = 0  # 默认值，避免历史接口失败时未定义
 
         # 用户信息：直连结果优先，否则用浏览器会话内获取的结果
+        user_display = ''
+        user_quota = None
         if user_info and isinstance(user_info, dict):
-            username = user_info.get('username', '')
+            user_display = user_info.get('display_name') or user_info.get('username', '')
+            user_quota = user_info.get('quota')
         elif client.browser_user_info and client.browser_user_info.get('success'):
             b_data = client.browser_user_info.get('data')
             if isinstance(b_data, dict):
-                username = b_data.get('username', '')
-            else:
-                username = ''
-        else:
-            username = ''
+                user_display = b_data.get('display_name') or b_data.get('username', '')
+                user_quota = b_data.get('quota')
 
-        if username:
-            # 用户名也脱敏，只显示前3个字符
-            masked_username = username[:3] + '***' if len(username) > 3 else '***'
+        if user_display:
+            masked_username = user_display[:3] + '***' if len(user_display) > 3 else '***'
             print(f'  用户: {masked_username}')
+            if user_quota is not None:
+                quota_usd = user_quota / 500000.0
+                print(f'  余额: ${quota_usd:.2f} ({user_quota:,} tokens)')
         else:
-            print('  用户: 获取失败（可能 session 已过期）')
+            print('  用户: 获取失败（可能 session 已过期或受限）')
 
         if result['success']:
             success_count += 1

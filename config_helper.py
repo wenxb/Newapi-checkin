@@ -35,17 +35,18 @@ def get_yes_no(prompt: str, default: bool = True) -> bool:
     return value in ['y', 'yes', '是']
 
 
-def test_account(url: str, session: str) -> bool:
+def test_account(url: str, session: str = None, username: str = None, password: str = None) -> bool:
     """测试账号配置是否有效"""
     try:
         from checkin import NewAPICheckin
-        client = NewAPICheckin(url, session)
+        client = NewAPICheckin(url, session_cookie=session, username=username, password=password)
         user_info = client.get_user_info()
         if user_info:
-            print(f'  ✅ 测试成功！用户名: {user_info.get("username")}')
+            name = user_info.get("display_name") or user_info.get("username")
+            print(f'  ✅ 测试成功！用户: {name}')
             return True
         else:
-            print('  ❌ 测试失败：无法获取用户信息（Session 可能无效）')
+            print('  ❌ 测试失败：无法获取用户信息（凭据可能无效或登录受限）')
             return False
     except Exception as e:
         print(f'  ❌ 测试失败: {e}')
@@ -62,7 +63,7 @@ def collect_accounts():
 
         # 站点 URL
         while True:
-            url = get_input('站点 URL（如 https://api.example.com）')
+            url = get_input('站点 URL（如 https://agentrouter.org 或 https://anyrouter.top）')
             if not url:
                 print('❌ URL 不能为空')
                 continue
@@ -70,44 +71,79 @@ def collect_accounts():
                 url = 'https://' + url
             break
 
-        # Session Cookie
-        while True:
-            session = get_input('Session Cookie')
-            if not session:
-                print('❌ Session 不能为空')
-                continue
-            break
-
         # 备注名称（可选）
         name = get_input('备注名称（可选，便于识别）', f'站点{account_num}')
 
-        # 用户ID（必填）
-        print('\n⚠️  重要：用户ID为必填字段，缺少会导致签到失败')
-        print('   用户ID通常是你用户名中的数字，如 user_123 的ID是 123')
+        # 选择认证方式
+        is_agent = 'agentrouter' in url.lower()
+        default_choice = '2' if is_agent else '1'
+        print('\n选择认证方式：')
+        print('1. Session Cookie（传统 NewAPI 站点）')
+        print('2. 邮箱/用户名 + 密码（AgentRouter 必须，或无需定期更新 Cookie）')
+        auth_choice = get_input('请选择认证方式 (1/2)', default_choice)
+
+        session = ''
+        username = ''
+        password = ''
         user_id = ''
-        while not user_id:
-            user_id = get_input('用户ID（必填）', '').strip()
-            if not user_id:
-                print('❌ 用户ID不能为空，请输入!')
 
-        # 是否测试
-        if get_yes_no('是否测试此账号配置', True):
-            print('正在测试...')
-            test_account(url, session)
+        if auth_choice == '2':
+            # 邮箱/用户名 + 密码
+            while True:
+                username = get_input('登录邮箱或用户名')
+                if not username:
+                    print('❌ 账号不能为空')
+                    continue
+                break
+            while True:
+                password = get_input('登录密码')
+                if not password:
+                    print('❌ 密码不能为空')
+                    continue
+                break
 
-        # 添加到列表
-        account_data = {
-            'url': url,
-            'session': session,
-            'user_id': user_id,
-            'name': name
-        }
+            # 是否测试
+            if get_yes_no('是否测试此账号配置', True):
+                print('正在测试登录...')
+                test_account(url, username=username, password=password)
+
+            account_data = {
+                'url': url,
+                'username': username,
+                'password': password,
+                'name': name
+            }
+        else:
+            # Session Cookie
+            while True:
+                session = get_input('Session Cookie')
+                if not session:
+                    print('❌ Session 不能为空')
+                    continue
+                break
+
+            # 用户ID（选填/推荐）
+            user_id = get_input('用户ID（可选，如 user_123 的ID是 123）', '').strip()
+
+            # 是否测试
+            if get_yes_no('是否测试此账号配置', True):
+                print('正在测试...')
+                test_account(url, session=session)
+
+            account_data = {
+                'url': url,
+                'session': session,
+                'name': name
+            }
+            if user_id:
+                account_data['user_id'] = user_id
 
         accounts.append(account_data)
 
         print(f'✅ 第 {account_num} 个账号添加成功')
 
         # 是否继续添加
+
         if not get_yes_no('\n是否继续添加账号', False):
             break
 

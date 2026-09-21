@@ -84,10 +84,13 @@ class CloudflareBypasser:
     (对应 Chrome 扩展在同一标签页中完成所有操作)
     """
 
-    def __init__(self, base_url: str, session_cookie: str = None, user_id: str = None):
+    def __init__(self, base_url: str, session_cookie: str = None, user_id: str = None,
+                 username: str = None, password: str = None):
         self.base_url = base_url.rstrip('/')
         self.session_cookie = session_cookie
         self.user_id = user_id
+        self.username = username
+        self.password = password
         self._playwright_available = self._check_playwright()
         self.user_info_cache = None  # 浏览器会话内获取的用户信息
         self.history_cache = None    # 浏览器会话内获取的签到历史
@@ -198,8 +201,9 @@ class CloudflareBypasser:
 
                 page = context.new_page()
 
+                target_url = f'{self.base_url}/login' if (self.username and self.password and not self.session_cookie) else self.base_url
                 print('[WAF 绕过] 正在加载页面并等待 WAF 验证...')
-                page.goto(self.base_url, wait_until='domcontentloaded', timeout=timeout * 1000)
+                page.goto(target_url, wait_until='domcontentloaded', timeout=timeout * 1000)
 
                 waf_solved = self._solve_cf_challenge(page, max_attempts=8, wait_seconds=6)
 
@@ -223,17 +227,66 @@ class CloudflareBypasser:
                 if self.user_id:
                     page.evaluate(f'() => localStorage.setItem("user", JSON.stringify({{"id": {self.user_id}}}))')
 
-                # 浏览器内一次会话完成: 用户信息 + 签到 + 签到历史
-                # 必须带 New-API-User 请求头（部分站点要求，否则 401）
+                # 浏览器内一次会话完成: 登录(如有) + 用户信息 + 签到 + 签到历史
                 user_id = self.user_id or 0
-                browser_data = page.evaluate('''async (uid) => {
+                eval_args = {
+                    'uid': user_id,
+                    'username': self.username,
+                    'password': self.password,
+                    'isAgentRouter': ('agentrouter' in self.base_url.lower())
+                }
+                browser_data = None
+                for eval_attempt in range(3):
+                    try:
+                        browser_data = page.evaluate('''async (args) => {
+                    const { uid, username, password, isAgentRouter } = args;
+                    let currentUid = uid || 0;
                     const headers = {
                         'Content-Type': 'application/json',
-                        'New-API-User': String(uid || 0)
+                        'New-API-User': String(currentUid)
                     };
                     const out = { user_info: null, checkin: null, history: null };
 
-                    // 1. 用户信息
+                    // 1. 如果提供了用户名和密码，在浏览器上下文中执行登录
+                    if (username && password) {
+                        try {
+                            const loginResp = await fetch('/api/user/login', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+                                body: JSON.stringify({ username, password }),
+                                credentials: 'include'
+                            });
+                            const loginText = await loginResp.text();
+                            let loginJson = null;
+                            try { loginJson = JSON.parse(loginText); } catch(e) {}
+                            if (loginJson && loginJson.success && loginJson.data) {
+                                if (loginJson.data.id) {
+                                    currentUid = loginJson.data.id;
+                                    headers['New-API-User'] = String(currentUid);
+                                }
+                                if (isAgentRouter) {
+                                    const checkedIn = loginJson.data.checked_in;
+                                    out.checkin = {
+                                        success: true,
+                                        alreadyCheckedIn: !checkedIn,
+                                        message: checkedIn ? '签到成功，新增额度已到账' : '登录成功 (今日已签到)',
+                                        data: loginJson.data,
+                                        httpStatus: loginResp.status
+                                    };
+                                }
+                            } else if (isAgentRouter) {
+                                out.checkin = {
+                                    success: false,
+                                    message: loginJson ? (loginJson.message || '登录失败') : ('登录失败: ' + loginText.substring(0, 100)),
+                                    httpStatus: loginResp.status
+                                };
+                            }
+                        } catch(e) {
+                            if (isAgentRouter) out.checkin = { success: false, error: e.message };
+                        }
+                    }
+
+                    // 2. 获取用户信息
                     try {
                         const r = await fetch('/api/user/self', { headers, credentials: 'include' });
                         const t = await r.text();
@@ -241,64 +294,115 @@ class CloudflareBypasser:
                             const j = JSON.parse(t);
                             out.user_info = { success: j.success === true, data: j.data || null,
                                               message: j.message, httpStatus: r.status };
+                            if (j.data && j.data.id) {
+                                currentUid = j.data.id;
+                                headers['New-API-User'] = String(currentUid);
+                            }
                         } catch (e) {
                             out.user_info = { error: '非 JSON: ' + t.substring(0, 100), httpStatus: r.status };
                         }
                     } catch (e) { out.user_info = { error: e.message }; }
 
-                    // 2. 签到
-                    try {
-                        const resp = await fetch('/api/user/sign_in', {
-                            method: 'POST',
-                            headers: headers,
-                            credentials: 'include'
-                        });
-                        const text = await resp.text();
+                    // 3. 执行签到（非 AgentRouter 且尚未完成签到时请求 /api/user/sign_in）
+                    if (!isAgentRouter && !out.checkin) {
                         try {
-                            const data = JSON.parse(text);
-                            const success = data.success === true || data.status === 'success' || data.ret === 1 || data.code === 0;
-                            const message = data.message || data.msg || data.data || '签到完成';
-                            const msgStr = typeof message === 'string' ? message : JSON.stringify(message);
-                            const alreadyKeywords = ['已签到', '已经签到', 'already', '重复签到', '今日已签'];
-                            const alreadyCheckedIn = !success && alreadyKeywords.some(k => msgStr.includes(k));
-                            out.checkin = {
-                                success: success || alreadyCheckedIn,
-                                alreadyCheckedIn,
-                                message: msgStr,
-                                httpStatus: resp.status,
-                                data: data
-                            };
+                            const resp = await fetch('/api/user/sign_in', {
+                                method: 'POST',
+                                headers: headers,
+                                credentials: 'include'
+                            });
+                            const text = await resp.text();
+                            try {
+                                const data = JSON.parse(text);
+                                const success = data.success === true || data.status === 'success' || data.ret === 1 || data.code === 0;
+                                const message = data.message || data.msg || data.data || '签到完成';
+                                const msgStr = typeof message === 'string' ? message : JSON.stringify(message);
+                                const alreadyKeywords = ['已签到', '已经签到', 'already', '重复签到', '今日已签'];
+                                const alreadyCheckedIn = !success && alreadyKeywords.some(k => msgStr.includes(k));
+                                out.checkin = {
+                                    success: success || alreadyCheckedIn,
+                                    alreadyCheckedIn,
+                                    message: msgStr,
+                                    httpStatus: resp.status,
+                                    data: data
+                                };
+                            } catch(e) {
+                                out.checkin = { error: 'Response is not JSON: ' + text.substring(0, 200), httpStatus: resp.status, success: false };
+                            }
                         } catch(e) {
-                            out.checkin = { error: 'Response is not JSON: ' + text.substring(0, 200), httpStatus: resp.status, success: false };
+                            out.checkin = { error: e.message, success: false, httpStatus: 0 };
                         }
-                    } catch(e) {
-                        out.checkin = { error: e.message, success: false, httpStatus: 0 };
                     }
 
-                    // 3. 签到历史
-                    try {
-                        const now = new Date();
-                        const month = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
-                        const r = await fetch('/api/user/checkin?month=' + month, { headers, credentials: 'include' });
-                        const t = await r.text();
+                    // 4. 签到历史（AgentRouter 使用 /api/log/self?type=4，其他使用 /api/user/checkin）
+                    if (isAgentRouter) {
                         try {
-                            const j = JSON.parse(t);
-                            out.history = { success: j.success === true, data: j.data || null, httpStatus: r.status };
-                        } catch (e) {
-                            out.history = { error: '非 JSON', httpStatus: r.status };
-                        }
-                    } catch (e) { out.history = { error: e.message }; }
+                            const r = await fetch('/api/log/self?type=4', { headers, credentials: 'include' });
+                            const t = await r.text();
+                            try {
+                                const j = JSON.parse(t);
+                                if (j.success && j.data) {
+                                    const total = j.data.total || 0;
+                                    const items = j.data.items || [];
+                                    out.history = {
+                                        success: true,
+                                        data: {
+                                            stats: {
+                                                checkin_count: total,
+                                                total_quota: total * 12500000,
+                                                checked_in_today: true
+                                            }
+                                        },
+                                        items: items,
+                                        httpStatus: r.status
+                                    };
+                                }
+                            } catch (e) {
+                                out.history = { error: '非 JSON', httpStatus: r.status };
+                            }
+                        } catch (e) { out.history = { error: e.message }; }
+                    } else {
+                        try {
+                            const now = new Date();
+                            const month = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+                            const r = await fetch('/api/user/checkin?month=' + month, { headers, credentials: 'include' });
+                            const t = await r.text();
+                            try {
+                                const j = JSON.parse(t);
+                                out.history = { success: j.success === true, data: j.data || null, httpStatus: r.status };
+                            } catch (e) {
+                                out.history = { error: '非 JSON', httpStatus: r.status };
+                            }
+                        } catch (e) { out.history = { error: e.message }; }
+                    }
 
                     return out;
-                }''', user_id)
+                }''', eval_args)
+                        if browser_data:
+                            break
+                    except Exception as eval_err:
+                        page.wait_for_timeout(2000)
+
+                if not browser_data:
+                    browser.close()
+                    return {'success': False, 'message': '浏览器会话内执行评估失败', 'error': 'evaluate failed'}
+
+                # 更新浏览器 cookie 至实例
+                for ck in context.cookies():
+                    if ck.get('name') == 'session':
+                        self.session_cookie = ck.get('value')
 
                 # 缓存用户信息与历史，供外部直接使用
                 self.user_info_cache = browser_data.get('user_info') or {}
                 self.history_cache = browser_data.get('history') or {}
                 checkin_result = browser_data.get('checkin') or {}
 
+                if isinstance(self.user_info_cache.get('data'), dict) and self.user_info_cache['data'].get('id'):
+                    self.user_id = str(self.user_info_cache['data']['id'])
+
                 print(f'[WAF 绕过] 签到结果: {checkin_result.get("message", checkin_result.get("error", "unknown"))}')
-                print(f'[WAF 绕过] 用户信息: {("success" if browser_data.get("user_info", {}).get("success") else "failed")}')
+                u_info = browser_data.get('user_info') or {}
+                print(f'[WAF 绕过] 用户信息: {("success" if u_info.get("success") else "failed")}')
                 hist = browser_data.get("history") or {}
                 if hist.get("success"):
                     print(f'[WAF 绕过] 签到历史: success')
@@ -312,12 +416,32 @@ class CloudflareBypasser:
 
             except Exception as e:
                 print(f'[WAF 绕过] Playwright 执行失败: {e}')
+                import traceback
+                traceback.print_exc()
                 if browser:
                     try:
                         browser.close()
                     except Exception:
                         pass
                 return None
+
+    def bypass_and_login(self, username: str = None, password: str = None, timeout: int = 120) -> Optional[dict]:
+        """
+        在 Playwright 会话中完成 WAF 绕过并执行邮箱/密码登录
+        """
+        if username:
+            self.username = username
+        if password:
+            self.password = password
+        res = self.bypass_and_checkin(timeout=timeout)
+        if not res:
+            return {'success': False, 'message': 'Playwright 登录绕过失败', 'checked_in': False}
+        return {
+            'success': res.get('success', False),
+            'message': res.get('message', ''),
+            'checked_in': not res.get('alreadyCheckedIn', False) if res.get('success') else False,
+            'data': res.get('data', {})
+        }
 
     @staticmethod
     def _mask_url(url: str) -> str:

@@ -5,10 +5,12 @@
 ## ✨ 功能特性
 
 - ✅ 支持单账号/多账号签到
-- ✅ **支持多个不同网站**（只要是基于 NewAPI 搭建的站点）
-- ✅ HTTP 直连，无需浏览器
+- ✅ **支持多个不同网站**（AnyRouter、AgentRouter 及通用 NewAPI / OneAPI 站点）
+- ✅ **支持邮箱/密码登录签到**（适配 AgentRouter 等无独立签到接口、登录即签到的平台）
+- ✅ **支持 Session Cookie 签到**（AnyRouter 等多数 NewAPI 站点）
+- ✅ HTTP 直连与 Playwright WAF 绕过双引擎
 - ✅ GitHub Actions 自动化执行
-- ✅ 详细的签到日志输出
+- ✅ 详细的签到日志输出与余额统计
 - ✅ 错误处理和超时控制
 - ✅ 支持手动触发和定时任务
 - ✅ **钉钉通知**（签到完成后自动推送结果）
@@ -141,34 +143,37 @@ https://your-domain.com#your_session_cookie
 https://site1.com#session1,https://site2.com#session2,https://site3.com#session3
 ```
 
-**实际示例（多个不同的 NewAPI 站点）：**
+**单账号格式（Session 或 邮箱密码）：**
 ```
-https://api.example1.com#MTc2NzQx...,https://api.example2.com#QVFMXzJh...,https://api.example3.com#RFhFN0FB...
+# Session 方式（AnyRouter 等）：
+https://anyrouter.top#your_session_cookie
+
+# 邮箱/密码方式（AgentRouter 等）：
+https://agentrouter.org#your_email@example.com#your_password
 ```
 
 **JSON 格式（推荐，支持备注和更好的可读性）：**
 ```json
 [
   {
-    "url": "https://api.example.com",
+    "url": "https://anyrouter.top",
     "session": "MTc2NzQxMzYzM3xEWDhFQVFMX2dBQUJFQUVRQUFE...",
     "user_id": "123",
-    "name": "主力站"
+    "name": "AnyRouter"
   },
   {
-    "url": "https://api2.example.com",
-    "session": "QVFMXzJhYWJFRUFRQUFEX3dfLUFBQVlHYzNS...",
-    "user_id": "456",
-    "name": "备用站"
-  },
-  {
-    "url": "https://api3.example.com",
-    "session": "RFhFN0FBQkVBRVFBQUQzd19fQUFBWUdjM1J5...",
-    "user_id": "789",
-    "name": "测试站"
+    "url": "https://agentrouter.org",
+    "username": "your_email@163.com",
+    "password": "your_password",
+    "name": "AgentRouter"
   }
 ]
 ```
+
+> 📌 **关于 AgentRouter 平台的特别说明：**
+> 1. AgentRouter 没有单独的签到接口（`/api/user/sign_in` 会返回 404）。
+> 2. 该平台只支持邮箱和密码登录，**真实的登录动作本身即触发每日签到领 $25 额度**。
+> 3. 因此在配置 AgentRouter 时，**请务必配置 `username` (或 `email`) 与 `password`**。
 
 #### 3. 启用 GitHub Actions
 
