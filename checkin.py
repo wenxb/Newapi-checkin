@@ -28,6 +28,45 @@ except ImportError:
     send_checkin_notification = None
 
 
+def rotate_clash_proxy(controller_url: str = 'http://127.0.0.1:9090', group_name: str = '🔰节点选择') -> Optional[str]:
+    """
+    通过 Mihomo / Clash External Controller 动态切换到下一个可用节点
+    返回切换后的节点名称，如果切换失败或控制器未开启则返回 None
+    """
+    import urllib.request
+    import urllib.parse
+
+    try:
+        encoded_group = urllib.parse.quote(group_name)
+        req = urllib.request.Request(f'{controller_url}/proxies/{encoded_group}')
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+
+        current = data.get('now')
+        all_proxies = [p for p in data.get('all', []) if p not in ('自动选择', '故障转移', 'DIRECT', 'REJECT')]
+        if not all_proxies:
+            return None
+
+        try:
+            idx = all_proxies.index(current)
+            next_node = all_proxies[(idx + 1) % len(all_proxies)]
+        except ValueError:
+            next_node = all_proxies[0]
+
+        switch_req = urllib.request.Request(
+            f'{controller_url}/proxies/{encoded_group}',
+            data=json.dumps({'name': next_node}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='PUT'
+        )
+        with urllib.request.urlopen(switch_req, timeout=3) as resp:
+            if resp.status in (200, 204):
+                return next_node
+    except Exception:
+        return None
+    return None
+
+
 class NewAPICheckin:
     """NewAPI 签到类"""
 
@@ -891,21 +930,45 @@ def main():
             print(f'  账号: {masked_acc}')
 
         use_proxy = account.get('use_proxy')
-        client = NewAPICheckin(
-            base_url=url,
-            session_cookie=session_cookie,
-            user_id=user_id,
-            cf_clearance=cf_clearance,
-            username=username,
-            password=password,
-            use_proxy=use_proxy
-        )
+        max_retries = 2
+        client = None
+        user_info = None
+        result = None
 
-        # 尝试直连获取用户信息（非 WAF 站点直接成功）
-        user_info = client.get_user_info()
+        for attempt in range(max_retries + 1):
+            client = NewAPICheckin(
+                base_url=url,
+                session_cookie=session_cookie,
+                user_id=user_id,
+                cf_clearance=cf_clearance,
+                username=username,
+                password=password,
+                use_proxy=use_proxy
+            )
 
-        # 执行签到（直连被 WAF 拦截时，浏览器会话会顺带获取用户信息）
-        result = client.checkin()
+            # 尝试直连获取用户信息（非 WAF 站点直接成功）
+            user_info = client.get_user_info()
+
+            # 执行签到（直连被 WAF 拦截时，浏览器会话会顺带获取用户信息）
+            result = client.checkin()
+
+            if result.get('success'):
+                break
+
+            err_msg = result.get('message', '')
+            if '密码' in err_msg or '未配置' in err_msg:
+                break
+
+            # 若使用代理且失败，尝试切换到下一个 Clash 节点重试
+            if client.use_proxy and attempt < max_retries:
+                switched_node = rotate_clash_proxy()
+                if switched_node:
+                    print(f'  [代理故障切换] 节点响应异常或受阻，自动切换至: {switched_node}，正在重试 ({attempt + 1}/{max_retries})...')
+                    import time
+                    time.sleep(1)
+                    continue
+            break
+
         checkin_count = 0  # 默认值，避免历史接口失败时未定义
 
         # 用户信息：直连结果优先，否则用浏览器会话内获取的结果

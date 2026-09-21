@@ -42,6 +42,11 @@ sed -i '/^allow-lan:/d' config.yaml
 sed -i '/^log-level:/d' config.yaml
 sed -i "1i mixed-port: ${PROXY_PORT}\nallow-lan: false\nlog-level: warning\n" config.yaml
 
+# 优化策略组健康检查参数：缩短检测间隔至 60 秒，测速地址改为高可用 204 地址
+sed -i 's|http://www.qualcomm.cn/generate_204|https://www.gstatic.com/generate_204|g' config.yaml
+sed -i 's|interval: 86400|interval: 60|g' config.yaml
+sed -i 's|interval: 7200|interval: 60|g' config.yaml
+
 echo "[INFO] 启动 mihomo 代理 (127.0.0.1:${PROXY_PORT})..."
 nohup "${MIHOMO_BIN}" -d "${PROXY_DIR}" -f config.yaml > mihomo.log 2>&1 &
 MIHOMO_PID=$!
@@ -69,6 +74,12 @@ if [[ "${READY}" != "true" ]]; then
 fi
 
 echo "[SUCCESS] Clash 代理已就绪: ${PROXY_URL}"
+
+# 触发策略组延迟测速，预热并让“自动选择”优选出最低延迟且健康的可用节点
+echo "[INFO] 正在对节点池进行健康测速与优选..."
+curl -fsS --max-time 5 "http://127.0.0.1:9090/group/%E8%87%AA%E5%8A%A8%E9%80%89%E6%8B%A9/delay?url=https://www.gstatic.com/generate_204&timeout=3000" > /dev/null 2>&1 || true
+curl -fsS -X PUT --max-time 3 "http://127.0.0.1:9090/proxies/%F0%9F%94%B0%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9" \
+    -H "Content-Type: application/json" -d '{"name": "自动选择"}' > /dev/null 2>&1 || true
 
 # 验证出口节点国家
 TRACE="$(curl -fsS -k -x "${PROXY_URL}" --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
