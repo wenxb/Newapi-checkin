@@ -93,12 +93,13 @@ class CloudflareBypasser:
     """
 
     def __init__(self, base_url: str, session_cookie: str = None, user_id: str = None,
-                 username: str = None, password: str = None):
+                 username: str = None, password: str = None, use_proxy: bool = True):
         self.base_url = base_url.rstrip('/')
         self.session_cookie = session_cookie
         self.user_id = user_id
         self.username = username
         self.password = password
+        self.use_proxy = use_proxy
         self._playwright_available = self._check_playwright()
         self.user_info_cache = None  # 浏览器会话内获取的用户信息
         self.history_cache = None    # 浏览器会话内获取的签到历史
@@ -180,8 +181,15 @@ class CloudflareBypasser:
         with sync_playwright() as p:
             browser = None
             try:
+                proxy_config = None
+                if self.use_proxy:
+                    proxy_url = os.environ.get('CHECKIN_PROXY_URL') or os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
+                    if proxy_url:
+                        proxy_config = {'server': proxy_url}
+
                 browser = p.chromium.launch(
                     headless=True,
+                    proxy=proxy_config,
                     args=[
                         '--disable-blink-features=AutomationControlled',
                         '--no-sandbox',

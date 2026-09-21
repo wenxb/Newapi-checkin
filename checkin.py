@@ -59,7 +59,8 @@ class NewAPICheckin:
         return '****'
 
     def __init__(self, base_url: str, session_cookie: str = None, user_id: str = None,
-                 cf_clearance: str = None, username: str = None, password: str = None):
+                 cf_clearance: str = None, username: str = None, password: str = None,
+                 use_proxy: bool = None):
         # 清理 URL：去掉末尾的 / 以及部分 .env 加载器（如 uv）对 # 转义引入的反斜杠
         self.base_url = base_url.strip().rstrip('/').replace('\\', '')
         # session 是 base64（不含反斜杠），清除转义引入的反斜杠
@@ -74,8 +75,19 @@ class NewAPICheckin:
         self.logged_in = False
         self.checkin_count = 0
 
+        # 智能选择是否使用代理：AnyRouter 直连通过率高（部分代理出口被 ESA 报 denied by http_custom），AgentRouter 默认走代理规避 WAF 滑块
+        if use_proxy is None:
+            if 'anyrouter' in self.base_url.lower():
+                self.use_proxy = False
+            else:
+                self.use_proxy = True
+        else:
+            self.use_proxy = bool(use_proxy)
+
         # 使用 curl_cffi 的浏览器指纹模拟（TLS/JA3），提升 Cloudflare 通过率
         self.session = requests.Session(impersonate='chrome')
+        if not self.use_proxy:
+            self.session.trust_env = False
         if self.session_cookie:
             self.session.cookies.set('session', self.session_cookie)
 
@@ -222,7 +234,8 @@ class NewAPICheckin:
             self.session_cookie,
             self.user_id,
             self.username,
-            self.password
+            self.password,
+            use_proxy=self.use_proxy
         )
         if not bypasser.is_available():
             return {'success': False, 'message': 'Playwright 未正确安装', 'checked_in': False}
@@ -550,7 +563,8 @@ class NewAPICheckin:
             self.session_cookie,
             self.user_id,
             self.username,
-            self.password
+            self.password,
+            use_proxy=self.use_proxy
         )
 
         if not bypasser.is_available():
@@ -682,6 +696,8 @@ def parse_accounts(accounts_str: str) -> list:
                         account['user_id'] = item['user_id']
                     if 'cf_clearance' in item:
                         account['cf_clearance'] = item['cf_clearance']
+                    if 'use_proxy' in item:
+                        account['use_proxy'] = item['use_proxy']
                     accounts.append(account)
             return accounts
     except json.JSONDecodeError:
@@ -874,13 +890,15 @@ def main():
             masked_acc = (username[:3] + '***' + username[username.find('@'):]) if '@' in username else (username[:3] + '***')
             print(f'  账号: {masked_acc}')
 
+        use_proxy = account.get('use_proxy')
         client = NewAPICheckin(
             base_url=url,
             session_cookie=session_cookie,
             user_id=user_id,
             cf_clearance=cf_clearance,
             username=username,
-            password=password
+            password=password,
+            use_proxy=use_proxy
         )
 
         # 尝试直连获取用户信息（非 WAF 站点直接成功）
