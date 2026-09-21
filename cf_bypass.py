@@ -52,26 +52,34 @@ def detect_waf_block(status_code: int, response_text: str) -> Tuple[bool, str]:
     检测通用 WAF/JS 挑战拦截（非 Cloudflare 站点也会遇到）
 
     已知特征:
-    - 阿里云盾: var arg1='XXXX' + 混淆脚本（acw_sc__v2 cookie）
-    - 其他 JS 挑战: <script>...<html> 结构 + 非 JSON
+    - 阿里云盾 WAF: <meta name="aliyun_waf_aa" ...>
+    - 阿里云盾 JS 挑战: var arg1='XXXX' + 混淆脚本（acw_sc__v2 cookie）
+    - 通用 API 接口返回非 JSON 的 HTML 页面（API 正常应返回 JSON，返回 HTML 即代表被 WAF/网关拦截）
     """
     if not response_text:
         return False, ''
 
-    # 阿里云盾: 响应为 <html><script>var arg1='...';(function(a,c){... 混淆代码
-    if 'var arg1=' in response_text and '<html>' in response_text.lower():
+    lower_text = response_text.lower()
+
+    # 阿里云盾特征
+    if 'aliyun_waf' in lower_text:
+        return True, '阿里云盾 WAF 挑战 (aliyun_waf)'
+    if 'acw_sc__v2' in lower_text or 'acw_tc' in lower_text:
         return True, '阿里云盾 JS 挑战 (acw_sc__v2)'
-    if 'acw_sc__v2' in response_text:
+    if 'var arg1=' in response_text:
         return True, '阿里云盾 JS 挑战 (acw_sc__v2)'
 
-    # 其他 JS 挑战: 非 JSON 且包含混淆脚本特征
+    # 尝试解析 JSON，如果成功则不是拦截
     try:
         import json
         json.loads(response_text)
         return False, ''
     except (json.JSONDecodeError, ValueError):
-        if '<html>' in response_text.lower() and 'script' in response_text.lower():
-            return True, 'WAF JS 挑战 (HTML + script 混淆)'
+        # 非 JSON 且为 HTML 响应（API 正常应返回 JSON，返回 HTML 即代表被 WAF/网关拦截）
+        if '<!doctype html' in lower_text or '<html' in lower_text:
+            if 'waf' in lower_text or 'challenge' in lower_text or 'script' in lower_text or 'shield' in lower_text:
+                return True, 'WAF JS 挑战 (HTML/Script 拦截)'
+            return True, 'WAF/页面拦截 (API 返回 HTML 挑战页面)'
 
     return False, ''
 
@@ -94,6 +102,7 @@ class CloudflareBypasser:
         self._playwright_available = self._check_playwright()
         self.user_info_cache = None  # 浏览器会话内获取的用户信息
         self.history_cache = None    # 浏览器会话内获取的签到历史
+        self.all_cookies = {}        # 浏览器会话内获取的所有 cookie
 
     def _check_playwright(self) -> bool:
         try:
@@ -201,7 +210,7 @@ class CloudflareBypasser:
 
                 page = context.new_page()
 
-                target_url = f'{self.base_url}/login' if (self.username and self.password and not self.session_cookie) else self.base_url
+                target_url = f'{self.base_url}/login' if (self.username and self.password) else self.base_url
                 print('[WAF 绕过] 正在加载页面并等待 WAF 验证...')
                 page.goto(target_url, wait_until='domcontentloaded', timeout=timeout * 1000)
 
@@ -214,15 +223,23 @@ class CloudflareBypasser:
 
                 # 等待阿里云盾挑战 cookie (acw_sc__v2) 出现且页面稳定（挑战通过后会自动刷新）
                 try:
-                    page.wait_for_load_state('networkidle', timeout=30000)
+                    page.wait_for_load_state('networkidle', timeout=15000)
                 except Exception:
                     pass
-                for _ in range(10):
+                for _ in range(12):
                     cookies = context.cookies()
                     if any(c['name'] == 'acw_sc__v2' for c in cookies):
                         break
+                    try:
+                        content = page.content().lower()
+                        if 'aliyun_waf' not in content and 'var arg1=' not in content:
+                            # 如果既不是 aliyun_waf 挑战也不是 var arg1=，且不是 AnyRouter 站点，跳出
+                            if 'anyrouter' not in self.base_url.lower():
+                                break
+                    except Exception:
+                        pass
                     page.wait_for_timeout(1000)
-                page.wait_for_timeout(2000)  # 等自动刷新完成
+                page.wait_for_timeout(2500)  # 等自动刷新完成
 
                 if self.user_id:
                     page.evaluate(f'() => localStorage.setItem("user", JSON.stringify({{"id": {self.user_id}}}))')
@@ -233,7 +250,7 @@ class CloudflareBypasser:
                     'uid': user_id,
                     'username': self.username,
                     'password': self.password,
-                    'isAgentRouter': ('agentrouter' in self.base_url.lower())
+                    'isAgentRouter': ('agentrouter' in self.base_url.lower() or 'air-outer' in self.base_url.lower())
                 }
                 browser_data = None
                 for eval_attempt in range(3):
@@ -388,6 +405,7 @@ class CloudflareBypasser:
                     return {'success': False, 'message': '浏览器会话内执行评估失败', 'error': 'evaluate failed'}
 
                 # 更新浏览器 cookie 至实例
+                self.all_cookies = {ck.get('name'): ck.get('value') for ck in context.cookies() if ck.get('name')}
                 for ck in context.cookies():
                     if ck.get('name') == 'session':
                         self.session_cookie = ck.get('value')

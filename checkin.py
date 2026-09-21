@@ -101,8 +101,9 @@ class NewAPICheckin:
             self.user_id = None
 
     def _is_agentrouter(self) -> bool:
-        """判断是否为 AgentRouter 平台"""
-        return 'agentrouter' in self.base_url.lower()
+        """判断是否为 AgentRouter 平台 (包含 agentrouter.org 和 ps.air-outer.com 备用域名)"""
+        url_lower = self.base_url.lower()
+        return 'agentrouter' in url_lower or 'air-outer' in url_lower
 
     def _extract_user_id_from_session(self, session_cookie: str) -> Optional[str]:
         """
@@ -231,6 +232,8 @@ class NewAPICheckin:
         if res.get('success'):
             self.cf_bypassed = True
             self.logged_in = True
+            if getattr(bypasser, 'all_cookies', None):
+                self.session.cookies.update(bypasser.all_cookies)
             if bypasser.session_cookie:
                 self.session_cookie = bypasser.session_cookie
                 self.session.cookies.set('session', self.session_cookie)
@@ -239,6 +242,8 @@ class NewAPICheckin:
                 self.session.headers.update({'new-api-user': str(self.user_id)})
             self.browser_user_info = bypasser.user_info_cache
             self.browser_history = bypasser.history_cache
+            if self.browser_user_info and self.browser_user_info.get('data'):
+                self.login_data = self.browser_user_info.get('data')
         return res
 
     def get_user_info(self, verbose: bool = False) -> Optional[dict]:
@@ -247,11 +252,14 @@ class NewAPICheckin:
 
         自动设置 new-api-user 请求头
         """
-        # 如果配置了用户名和密码且尚未登录且无有效 session，先尝试登录
-        if self.username and self.password and not self.logged_in and not self.session_cookie:
+        # 如果配置了用户名和密码且尚未登录，优先执行登录
+        if self.username and self.password and not self.logged_in:
             login_res = self.login(verbose=verbose)
-            if not login_res['success'] and login_res.get('http_status') != 429:
-                return None
+            if not login_res.get('success') and login_res.get('http_status') != 429:
+                if not self.logged_in:
+                    return None
+            if self.browser_user_info and self.browser_user_info.get('data'):
+                return self.browser_user_info['data']
 
         try:
             resp = self.session.get(f'{self.base_url}/api/user/self', timeout=30)
@@ -407,11 +415,32 @@ class NewAPICheckin:
 
     def _get_agentrouter_log_status(self) -> Optional[dict]:
         """从 AgentRouter 的 /api/log/self?type=4 获取签到日志记录"""
-        try:
-            import pytz
-            beijing_tz = pytz.timezone('Asia/Shanghai')
-            today_str = datetime.now(beijing_tz).strftime('%Y-%m-%d')
+        import pytz
+        beijing_tz = pytz.timezone('Asia/Shanghai')
+        today_str = datetime.now(beijing_tz).strftime('%Y-%m-%d')
 
+        # 1. 优先使用浏览器中抓取到的签到历史数据（已绕过 WAF）
+        if self.browser_history and isinstance(self.browser_history, dict):
+            items = self.browser_history.get('items') or []
+            stats = self.browser_history.get('data', {}).get('stats', {}) if isinstance(self.browser_history.get('data'), dict) else {}
+            total = stats.get('checkin_count', len(items))
+            self.checkin_count = total
+            if items:
+                latest = items[0]
+                created_at = latest.get('created_at', 0)
+                log_date = datetime.fromtimestamp(created_at, beijing_tz).strftime('%Y-%m-%d')
+                content = latest.get('content', '')
+                quota_awarded = 12500000
+                return {
+                    'checked_in_today': (log_date == today_str),
+                    'checkin_date': log_date,
+                    'content': content,
+                    'quota_awarded': quota_awarded,
+                    'total': total
+                }
+
+        # 2. 直连 API 获取
+        try:
             resp = self.session.get(f'{self.base_url}/api/log/self?type=4', timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
@@ -544,6 +573,14 @@ class NewAPICheckin:
         # 同一浏览器会话内顺带获取用户信息和签到历史，避免再次被 WAF 拦截
         self.browser_user_info = bypasser.user_info_cache
         self.browser_history = bypasser.history_cache
+        if getattr(bypasser, 'all_cookies', None):
+            self.session.cookies.update(bypasser.all_cookies)
+        if bypasser.session_cookie:
+            self.session_cookie = bypasser.session_cookie
+            self.session.cookies.set('session', self.session_cookie)
+        if bypasser.user_id:
+            self.user_id = str(bypasser.user_id)
+            self.session.headers.update({'new-api-user': str(self.user_id)})
 
         if browser_result.get('alreadyCheckedIn'):
             result['success'] = True
