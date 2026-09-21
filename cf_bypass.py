@@ -84,6 +84,65 @@ def detect_waf_block(status_code: int, response_text: str) -> Tuple[bool, str]:
     return False, ''
 
 
+def detect_risk_control(status_code: int = 200, response_text: str = '', data: dict = None) -> Tuple[bool, str]:
+    """
+    统一风控与拦截识别：
+    判断当前请求是否命中站点风控、WAF 滑块/人机验证、IP 黑名单或频率限制
+    """
+    # 1. 状态码判断
+    if status_code in (403, 429):
+        reason = f'HTTP {status_code} ' + ('频率限制 (Too Many Requests)' if status_code == 429 else '访问受限/IP禁止 (Forbidden)')
+        return True, reason
+
+    # 2. 响应体特征 (WAF/滑块/人机/验证码)
+    lower_text = (response_text or '').lower()
+    waf_keywords = [
+        ('aliyun_waf', '阿里云盾 WAF 挑战'),
+        ('acw_sc__v2', '阿里云盾 JS 挑战'),
+        ('baxia-dialog', '阿里云滑块验证弹窗'),
+        ('punish', '安全风控惩罚/拦截页面'),
+        ('滑动验证', '滑动验证码拦截'),
+        ('滑块验证', '滑块人机验证'),
+        ('人机验证', '人机安全验证'),
+        ('安全验证', '安全验证拦截'),
+        ('请完成验证', '人机安全验证'),
+        ('just a moment', 'Cloudflare JS 挑战'),
+        ('cf-challenge', 'Cloudflare 验证挑战'),
+        ('turnstile', 'Cloudflare Turnstile 验证'),
+        ('denied by http_custom', 'ESA 自定义规则拦截'),
+        ('denied by http_ratelimit', 'ESA 速率限制拦截'),
+    ]
+    for kw, label in waf_keywords:
+        if kw in lower_text:
+            return True, f'命中 WAF/滑块验证 ({label})'
+
+    # 3. JSON 消息体关键词检测
+    msg = ''
+    if data and isinstance(data, dict):
+        msg = str(data.get('message') or data.get('msg') or data.get('data') or '')
+    elif response_text:
+        try:
+            import json
+            parsed = json.loads(response_text)
+            if isinstance(parsed, dict):
+                msg = str(parsed.get('message') or parsed.get('msg') or parsed.get('data') or '')
+        except Exception:
+            pass
+
+    if msg:
+        msg_lower = msg.lower()
+        risk_words = [
+            '频繁', '验证码', '人机', '滑块', '安全验证',
+            '风控', '黑名单', '受限', '环境异常', '异常登录',
+            'rate limit', 'blocked', 'forbidden'
+        ]
+        for rw in risk_words:
+            if rw in msg_lower:
+                return True, f'接口返回风控提示: {msg}'
+
+    return False, ''
+
+
 class CloudflareBypasser:
     """
     使用 Playwright 无头浏览器绕过 Cloudflare 防护

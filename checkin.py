@@ -14,12 +14,13 @@ from datetime import datetime
 from typing import Optional
 
 try:
-    from cf_bypass import detect_cloudflare_block, detect_waf_block, CloudflareBypasser
+    from cf_bypass import detect_cloudflare_block, detect_waf_block, detect_risk_control, CloudflareBypasser
     CF_BYPASS_AVAILABLE = True
 except ImportError:
     CF_BYPASS_AVAILABLE = False
     detect_cloudflare_block = None
     detect_waf_block = None
+    detect_risk_control = None
     CloudflareBypasser = None
 
 try:
@@ -28,31 +29,75 @@ except ImportError:
     send_checkin_notification = None
 
 
-def rotate_clash_proxy(controller_url: str = 'http://127.0.0.1:9090', group_name: str = '🔰节点选择') -> Optional[str]:
-    """
-    通过 Mihomo / Clash External Controller 动态切换到下一个可用节点
-    返回切换后的节点名称，如果切换失败或控制器未开启则返回 None
-    """
+def get_current_clash_node(controller_url: str = 'http://127.0.0.1:9090', group_name: str = '🔰节点选择') -> Optional[str]:
+    """获取当前 Clash 选中的出口节点名称"""
     import urllib.request
     import urllib.parse
-
     try:
         encoded_group = urllib.parse.quote(group_name)
         req = urllib.request.Request(f'{controller_url}/proxies/{encoded_group}')
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode('utf-8'))
+            return data.get('now')
+    except Exception:
+        return None
 
-        current = data.get('now')
-        all_proxies = [p for p in data.get('all', []) if p not in ('自动选择', '故障转移', 'DIRECT', 'REJECT')]
-        if not all_proxies:
-            return None
 
-        try:
-            idx = all_proxies.index(current)
-            next_node = all_proxies[(idx + 1) % len(all_proxies)]
-        except ValueError:
-            next_node = all_proxies[0]
+def rotate_clash_proxy(controller_url: str = 'http://127.0.0.1:9090',
+                       group_name: str = '🔰节点选择',
+                       exclude_nodes: set = None) -> Optional[str]:
+    """
+    通过 Mihomo / Clash External Controller 动态切换到下一个可用节点
+    优先选择已验证存活 (delay > 0) 且未被排除的健康节点
+    """
+    import urllib.request
+    import urllib.parse
 
+    if exclude_nodes is None:
+        exclude_nodes = set()
+
+    try:
+        encoded_group = urllib.parse.quote(group_name)
+
+        # 1. 获取所有节点状态与延迟历史
+        req_all = urllib.request.Request(f'{controller_url}/proxies')
+        with urllib.request.urlopen(req_all, timeout=3) as resp:
+            all_data = json.loads(resp.read().decode('utf-8'))
+        all_proxies_map = all_data.get('proxies', {})
+
+        # 2. 获取当前策略组信息
+        req_group = urllib.request.Request(f'{controller_url}/proxies/{encoded_group}')
+        with urllib.request.urlopen(req_group, timeout=3) as resp:
+            group_data = json.loads(resp.read().decode('utf-8'))
+        current = group_data.get('now')
+        group_proxies = [p for p in group_data.get('all', []) if p not in ('自动选择', '故障转移', 'DIRECT', 'REJECT')]
+
+        # 3. 筛选存活节点（delay > 0 优先）
+        alive_candidates = []
+        for name in group_proxies:
+            p_info = all_proxies_map.get(name, {})
+            history = p_info.get('history', [])
+            delay = history[-1].get('delay', 0) if history else 0
+            if delay and delay > 0:
+                alive_candidates.append((name, delay))
+
+        alive_candidates.sort(key=lambda x: x[1])
+        candidate_names = [x[0] for x in alive_candidates] or group_proxies
+
+        # 过滤掉已排除节点和当前节点
+        filtered = [c for c in candidate_names if c not in exclude_nodes and c != current]
+        if not filtered:
+            filtered = [c for c in group_proxies if c not in exclude_nodes and c != current]
+
+        if not filtered:
+            # 如果所有候选都在排除列表中，兜底取未在当前节点的第一个
+            filtered = [c for c in group_proxies if c != current]
+            if not filtered:
+                return None
+
+        next_node = filtered[0]
+
+        # 4. 下发切换指令
         switch_req = urllib.request.Request(
             f'{controller_url}/proxies/{encoded_group}',
             data=json.dumps({'name': next_node}).encode('utf-8'),
@@ -207,30 +252,48 @@ class NewAPICheckin:
             if verbose:
                 print(f'  [调试] 登录 HTTP 状态码: {resp.status_code}')
 
-            # 429 请求过多处理
-            if resp.status_code == 429:
-                return {
-                    'success': False,
-                    'message': '请求过于频繁 (HTTP 429: 登录频率限制)，请稍后再试',
-                    'checked_in': False,
-                    'http_status': 429
-                }
+            # 检测 WAF/风控拦截
+            is_risk = False
+            risk_reason = ''
+            if detect_risk_control:
+                is_risk, risk_reason = detect_risk_control(resp.status_code, resp.text)
+            elif resp.status_code in (403, 429):
+                is_risk = True
+                risk_reason = f'HTTP {resp.status_code}'
+            elif detect_waf_block:
+                is_risk, risk_reason = detect_waf_block(resp.status_code, resp.text)
 
-            # 检测 WAF 拦截
-            is_blocked = False
-            reason = ''
-            if detect_waf_block:
-                is_blocked, reason = detect_waf_block(resp.status_code, resp.text)
-            if not is_blocked and detect_cloudflare_block:
-                is_blocked, reason = detect_cloudflare_block(resp.status_code, resp.text)
-            if is_blocked:
-                print(f'[WAF] 登录时检测到 {reason}，尝试浏览器绕过...')
-                return self._cf_bypass_login()
+            if is_risk:
+                if self.use_proxy:
+                    # 代理模式下命中风控拦截（如阿里云盾滑块/验证码/403），直接判定当前节点已被风控
+                    print(f'  [风控检测] 登录请求触发安全风控: {risk_reason}')
+                    return {
+                        'success': False,
+                        'message': f'触发风控拦截 ({risk_reason})',
+                        'checked_in': False,
+                        'is_risk_control': True,
+                        'http_status': resp.status_code
+                    }
+                else:
+                    # 直连模式下（如 AnyRouter），尝试 Playwright 浏览器绕过
+                    print(f'[WAF] 登录时检测到 {risk_reason}，尝试浏览器绕过...')
+                    res = self._cf_bypass_login()
+                    if not res.get('success'):
+                        res['is_risk_control'] = True
+                    return res
 
             try:
                 data = resp.json()
             except json.JSONDecodeError:
-                return {'success': False, 'message': f'响应格式非 JSON (HTTP {resp.status_code}): {resp.text[:100]}', 'checked_in': False}
+                is_rc, reason_rc = False, ''
+                if detect_risk_control:
+                    is_rc, reason_rc = detect_risk_control(resp.status_code, resp.text)
+                return {
+                    'success': False,
+                    'message': f'响应格式非 JSON (HTTP {resp.status_code}): {resp.text[:100]}',
+                    'checked_in': False,
+                    'is_risk_control': is_rc or resp.status_code in (403, 429)
+                }
 
             if resp.status_code == 200 and data.get('success'):
                 user_data = data.get('data') or {}
@@ -254,12 +317,20 @@ class NewAPICheckin:
                 }
             else:
                 msg = data.get('message', '未知错误')
-                return {'success': False, 'message': f'登录失败: {msg}', 'checked_in': False}
+                is_rc, reason_rc = False, ''
+                if detect_risk_control:
+                    is_rc, reason_rc = detect_risk_control(resp.status_code, resp.text, data)
+                return {
+                    'success': False,
+                    'message': f'登录失败: {msg}',
+                    'checked_in': False,
+                    'is_risk_control': is_rc
+                }
 
         except requests.exceptions.Timeout:
-            return {'success': False, 'message': '登录请求超时', 'checked_in': False}
+            return {'success': False, 'message': '登录请求超时', 'checked_in': False, 'is_risk_control': True}
         except requests.exceptions.RequestException as e:
-            return {'success': False, 'message': f'登录网络请求失败: {e}', 'checked_in': False}
+            return {'success': False, 'message': f'登录网络请求失败: {e}', 'checked_in': False, 'is_risk_control': True}
         except Exception as e:
             return {'success': False, 'message': f'登录异常: {e}', 'checked_in': False}
 
@@ -534,28 +605,33 @@ class NewAPICheckin:
                 result['message'] = '认证失败: Session 可能已过期，请重新获取'
                 return result
 
+            # 检测风控 / WAF
+            is_risk = False
+            risk_reason = ''
+            if detect_risk_control:
+                is_risk, risk_reason = detect_risk_control(resp.status_code, resp.text)
+            elif resp.status_code in (403, 429):
+                is_risk = True
+                risk_reason = f'HTTP {resp.status_code}'
+
+            if is_risk:
+                if self.use_proxy:
+                    result['message'] = f'触发风控拦截 ({risk_reason})'
+                    result['is_risk_control'] = True
+                    return result
+                print(f'[WAF] 检测到拦截: {risk_reason}')
+                bypass_res = self._cf_bypass_checkin()
+                if not bypass_res.get('success'):
+                    bypass_res['is_risk_control'] = True
+                return bypass_res
+
             try:
                 data = resp.json()
             except json.JSONDecodeError:
-                # 检测 WAF 拦截（Cloudflare / 阿里云盾），走浏览器绕过
-                is_blocked = False
-                reason = ''
-                if detect_waf_block:
-                    is_blocked, reason = detect_waf_block(resp.status_code, resp.text)
-                if not is_blocked and detect_cloudflare_block:
-                    is_blocked, reason = detect_cloudflare_block(resp.status_code, resp.text)
-                if is_blocked:
-                    print(f'[WAF] 检测到拦截: {reason}')
-                    return self._cf_bypass_checkin()
                 content_preview = resp.text[:200] if resp.text else '(空响应)'
                 result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
+                result['is_risk_control'] = resp.status_code in (403, 429)
                 return result
-
-            if detect_cloudflare_block and resp.status_code in (403, 503):
-                is_blocked, reason = detect_cloudflare_block(resp.status_code, json.dumps(data))
-                if is_blocked:
-                    print(f'[WAF] 检测到 Cloudflare 拦截: {reason}')
-                    return self._cf_bypass_checkin()
 
             if resp.status_code == 200:
                 if data.get('success'):
@@ -566,14 +642,22 @@ class NewAPICheckin:
                     result['checkin_date'] = checkin_data.get('checkin_date')
                     result['quota_awarded'] = checkin_data.get('quota_awarded')
                 else:
-                    result['message'] = data.get('message', '签到失败')
+                    msg = data.get('message', '签到失败')
+                    result['message'] = msg
+                    if detect_risk_control:
+                        is_rc, reason_rc = detect_risk_control(resp.status_code, resp.text, data)
+                        result['is_risk_control'] = is_rc
             else:
-                result['message'] = f'HTTP {resp.status_code}: {data.get("message", "未知错误")}'
+                msg = data.get('message', '未知错误')
+                result['message'] = f'HTTP {resp.status_code}: {msg}'
+                result['is_risk_control'] = resp.status_code in (403, 429)
 
         except requests.exceptions.Timeout:
             result['message'] = '请求超时'
+            result['is_risk_control'] = True
         except requests.exceptions.RequestException as e:
             result['message'] = f'网络请求失败: {e}'
+            result['is_risk_control'] = True
         except Exception as e:
             result['message'] = f'未知错误: {e}'
 
@@ -930,10 +1014,11 @@ def main():
             print(f'  账号: {masked_acc}')
 
         use_proxy = account.get('use_proxy')
-        max_retries = 2
+        max_retries = 3
         client = None
         user_info = None
         result = None
+        exclude_nodes = set()
 
         for attempt in range(max_retries + 1):
             client = NewAPICheckin(
@@ -946,7 +1031,9 @@ def main():
                 use_proxy=use_proxy
             )
 
-            # 尝试直连获取用户信息（非 WAF 站点直接成功）
+            current_node = get_current_clash_node() if client.use_proxy else None
+
+            # 尝试直连获取用户信息（若需账号密码，会在其中执行登录）
             user_info = client.get_user_info()
 
             # 执行签到（直连被 WAF 拦截时，浏览器会话会顺带获取用户信息）
@@ -956,16 +1043,29 @@ def main():
                 break
 
             err_msg = result.get('message', '')
-            if '密码' in err_msg or '未配置' in err_msg:
+            is_risk = result.get('is_risk_control', False)
+
+            # 凭据错误不重试
+            if '密码错误' in err_msg or '未配置' in err_msg:
                 break
 
-            # 若使用代理且失败，尝试切换到下一个 Clash 节点重试
+            # 错误消息智能匹配风控/拦截特征
+            if not is_risk:
+                risk_clues = ['风控', '频繁', '验证', '滑块', '拦截', '403', '429', 'waf', '超时', '网络请求失败', 'timed out']
+                if any(k in err_msg.lower() for k in risk_clues):
+                    is_risk = True
+
+            # 若使用代理且失败，自动换节点重试
             if client.use_proxy and attempt < max_retries:
-                switched_node = rotate_clash_proxy()
+                if current_node:
+                    exclude_nodes.add(current_node)
+                switched_node = rotate_clash_proxy(exclude_nodes=exclude_nodes)
                 if switched_node:
-                    print(f'  [代理故障切换] 节点响应异常或受阻，自动切换至: {switched_node}，正在重试 ({attempt + 1}/{max_retries})...')
+                    trigger_label = '触发站点风控/滑块验证' if is_risk else '节点网络故障/响应异常'
+                    print(f'  [风控自动换节点] {trigger_label} ({err_msg})')
+                    print(f'  [风控自动换节点] 已将受阻节点 [{current_node or "当前节点"}] 加入排除列表，自动切换至存活优选节点: [{switched_node}]，重试中 ({attempt + 1}/{max_retries})...')
                     import time
-                    time.sleep(1)
+                    time.sleep(1.5)
                     continue
             break
 
